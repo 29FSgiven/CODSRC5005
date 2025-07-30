@@ -1,0 +1,1 @@
+"C:/cod4mp_cod4x/iw3mp.exe" +connect d43.ovh:29000 +com_maxfps 250 +r_mode 1024x768 +r_fullscreen 0 +name hanswurst

@@ -1,0 +1,2 @@
+drmemory -- filesync.exe
+pause

@@ -1,0 +1,21 @@
+Was wir schon geschafft haben:
+
++Protokoll-Design
++TCP-Server programmiert, welcher mehrere eingehende Clientverbindungen akzeptieren kann und auf diese nicht blockierend reagieren kann 
++Einlesen einer Dateistruktur (Verzeichnis), Hashberechnung aller im Verzeichnis befindlicher Dateien und speichern der Informationen mit Größe in Datenstruktur
++Auf Clientanfrage die Dateiliste mit den zugehörigen Informationen ausliefern
++Auf Clientanfrage Dateien aus der Dateiliste lesen und an den Client senden
++Client kann sich mit Server verbinden
++Client kann die Dateiliste anfordern, empfangen und speichern
++Client kann prüfen welche der eigenen Dateien nicht mit der Dateiliste vom Server übereinstimmen
++Client kann fehlende oder veränderte Dateien automatisch beim Server anfordern
++Client kann Dateien empfangen und bei sich speichern
+
+Was wir noch erledigen müssen:
+
+-Eventuell mehr Fehlerbehandlungen im Programm
+-Optimierungen einiger Vorgänge bzw. Leistungsverbesserungen
+-Server automatisch die Dateiliste auf Änderungen überprüfen lassen und Dateistruktur neu einlesen
+-Eventuell Passwortauthentifizierung
+-Eventuell TLS
+-Dokumentation

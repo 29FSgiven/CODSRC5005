@@ -1,0 +1,947 @@
+// steamcrap.cpp : Defines the entry point for the console application.
+//
+
+#include <stdint.h>
+#include <windows.h>
+#include <stdio.h>
+#include <iostream>
+
+#define CON_CHANNEL_SYSTEM 0x10
+
+extern "C" {
+	void Com_Printf(int channel, const char *fmt, ...);
+	void Com_DPrintf(int channel, const char *fmt, ...);
+	void Com_Error(int type, const char *fmt, ...);
+	void Com_PrintError(int channel, const char *fmt, ...);
+	int Com_sprintf(char *dest, int size, const char *fmt, ...);
+	void Q_strncpyz( char *dest, const char *src, int destsize );
+	void SV_SteamSetUserInfo(uint64_t steamid, int haslicense, int valid);
+	void Com_Quit_f();
+	int SV_GetSteamUserInfo(uint64_t* steamid, char** playername, int* score);
+	const char* Sys_ExeFile(void);
+	void Com_LogDebugData(byte* data, int len);
+    void Com_Error(int, const char* fmt, ...);
+}
+
+#define strncpy_s Q_strncpyz
+#define sprintf_s Com_sprintf
+
+/*
+#define VERSION_SAFE_STEAM_API_INTERFACES
+#define STEAMAPPLIST_INTERFACE_VERSION "STEAMAPPLIST_INTERFACE_VERSION001"
+#define STEAMMUSIC_INTERFACE_VERSION "STEAMMUSIC_INTERFACE_VERSION001"
+#define STEAMMUSICREMOTE_INTERFACE_VERSION "STEAMMUSICREMOTE_INTERFACE_VERSION001"
+#define STEAMHTMLSURFACE_INTERFACE_VERSION "STEAMHTMLSURFACE_INTERFACE_VERSION_002"
+//#define STEAMGAMESERVER_INTERFACE_VERSION "012"
+*/
+
+#undef __cdecl
+#define __linux__
+#define CALLBACK_GNUFIXUP
+#include "steam_api.h"
+#include "steam_gameserver.h"
+#include "opensteamworks/IClientEngine.h"
+#include "opensteamworks/IClientApps.h" 
+#include "opensteamworks/IClientUtils.h" 
+#include "opensteamworks/IClientUser.h"
+
+#ifndef __cdecl
+		#define __cdecl
+#endif
+//#define USE_GS_AUTH_API
+//csid = gameserver->GetSteamID();
+
+
+char accounttype[] = {'I', 'U', 'M', 'G', 'A', 'P', 'C', 'g', 'c', '?', '?', '?', '?', '?', '?', '?'};
+
+extern "C" void Com_SteamClientApi_DebugCallback(int nSeverity, const char *pchDebugText);
+
+
+class SteamGameClientBridge
+{
+public:
+
+	//Constructor
+	SteamGameClientBridge( );
+
+	// Destructor
+	~SteamGameClientBridge();
+
+	static SteamGameClientBridge* Init( const wchar_t* dllpath, int appID );
+	static SteamGameClientBridge* InitAPI( const wchar_t* dllpath, int appID );
+	
+	void RunFrame( );
+	
+	bool isAdvertisingServer;
+
+	uint32 GetAuthTicket(unsigned char* data, int buflen);
+
+	void CancelAuthTicket( );
+
+	
+	private:
+	//
+	// Various callback functions that Steam will call to let us know about events related to our
+	// connection to the Steam servers for authentication purposes.
+	//
+
+	// ipc failure handler
+	STEAM_CALLBACK( SteamGameClientBridge, OnIPCFailure, IPCFailure_t, m_IPCFailureCallback );
+
+	// Steam wants to shut down, Game for Windows applications should shutdown too
+	STEAM_CALLBACK( SteamGameClientBridge, OnSteamShutdown, SteamShutdown_t, m_SteamShutdownCallback );
+	
+	// callback for when the lobby game server has started
+	STEAM_CALLBACK( SteamGameClientBridge, OnGameJoinRequested, GameRichPresenceJoinRequested_t, m_GameJoinRequested );
+
+	// callbacks for Steam connection state
+	STEAM_CALLBACK( SteamGameClientBridge, OnSteamServersConnected, SteamServersConnected_t, m_SteamServersConnected );
+	STEAM_CALLBACK( SteamGameClientBridge, OnSteamServersDisconnected, SteamServersDisconnected_t, m_SteamServersDisconnected );
+	STEAM_CALLBACK( SteamGameClientBridge, OnSteamServerConnectFailure, SteamServerConnectFailure_t, m_SteamServerConnectFailure );
+	STEAM_CALLBACK( SteamGameClientBridge, OnGameOverlayActivated, GameOverlayActivated_t, m_CallbackGameOverlayActivated );
+	
+	// callback when getting the results of a web call
+	STEAM_CALLBACK( SteamGameClientBridge, OnGameWebCallback, GameWebCallback_t, m_CallbackGameWebCallback );
+	// Function to tell Steam about our servers details
+	
+	void SendUpdatedServerDetailsToSteam();
+
+	// Track whether our server is connected to Steam ok (meaning we can restrict who plays based on 
+	// ownership and VAC bans, etc...)
+
+	bool m_bConnectedToSteam;
+	//CSteamGameServerAPIContext serverapictx;
+	bool initialized;
+	HAuthTicket m_hAuthTicket;
+
+};
+
+//-----------------------------------------------------------------------------
+// Purpose: Handles notification of a steam ipc failure
+// we may get multiple callbacks, one for each IPC operation we attempted
+// since the actual failure, so protect ourselves from alerting more than once.
+//-----------------------------------------------------------------------------
+void SteamGameClientBridge::OnIPCFailure( IPCFailure_t *failure )
+{
+	static bool bExiting = false;
+	if ( !bExiting )
+	{
+		Com_Error(0, "Steam IPC Failure, shutting down...\n" );
+		bExiting = true;
+	}
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: Steam is asking us to join a game, based on the user selecting
+//			'join game' on a friend in their friends list 
+//			the string comes from the "connect" field set in the friends' rich presence
+//-----------------------------------------------------------------------------
+void SteamGameClientBridge::OnGameJoinRequested( GameRichPresenceJoinRequested_t *pCallback )
+{
+	Com_Printf("Steam want to connect me to: %s\n", pCallback->m_rgchConnect);
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: Handles notification of a Steam shutdown request since a Windows
+// user in a second concurrent session requests to play this game. Shutdown
+// this process immediately if possible.
+//-----------------------------------------------------------------------------
+void SteamGameClientBridge::OnSteamShutdown( SteamShutdown_t *callback )
+{
+	static bool bExiting = false;
+	if ( !bExiting )
+	{
+		OutputDebugString( "Steam shutdown request, shutting down\n" );
+		Com_Quit_f();
+		bExiting = true;
+	}
+}
+
+
+//-----------------------------------------------------------------------------
+// Purpose: Handles notification that we are now connected to Steam
+//-----------------------------------------------------------------------------
+void SteamGameClientBridge::OnSteamServersConnected( SteamServersConnected_t *callback )
+{
+	if ( SteamUser()->BLoggedOn() )
+		m_bConnectedToSteam = true;
+	else
+	{
+		OutputDebugString( "Steam: Got SteamServersConnected_t, but not logged on?\n" );
+	}
+}
+
+
+//-----------------------------------------------------------------------------
+// Purpose: Handles notification that we are now connected to Steam
+//-----------------------------------------------------------------------------
+void SteamGameClientBridge::OnSteamServersDisconnected( SteamServersDisconnected_t *callback )
+{
+	m_bConnectedToSteam = false;
+	Com_Printf( "Steam: Got SteamServersDisconnected_t\n" );
+}
+
+
+//-----------------------------------------------------------------------------
+// Purpose: Handles notification that the Steam overlay is shown/hidden, note, this
+// doesn't mean the overlay will or will not draw, it may still draw when not active.
+// This does mean the time when the overlay takes over input focus from the game.
+//-----------------------------------------------------------------------------
+void SteamGameClientBridge::OnGameOverlayActivated( GameOverlayActivated_t *callback )
+{
+	/*
+	if ( callback->m_bActive )	
+		Com_Printf( "Steam overlay now active\n" );
+	else
+		Com_Printf( "Steam overlay now inactive\n" );
+	*/
+}
+
+
+//-----------------------------------------------------------------------------
+// Purpose: Handle the callback from the user clicking a steam://gamewebcallback/ link in the overlay browser
+//	You can use this to add support for external site signups where you want to pop back into the browser
+//  after some web page signup sequence, and optionally get back some detail about that.
+//-----------------------------------------------------------------------------
+void SteamGameClientBridge::OnGameWebCallback( GameWebCallback_t *callback )
+{
+	//m_bSentWebOpen = false;
+	Com_Printf( "Steam: User submitted following url: %s\n", callback->m_szURL );
+}
+
+
+//-----------------------------------------------------------------------------
+// Purpose: Handles notification that we are failed to connected to Steam
+//-----------------------------------------------------------------------------
+void SteamGameClientBridge::OnSteamServerConnectFailure( SteamServerConnectFailure_t *callback )
+{
+	Com_Printf( "SteamServerConnectFailure_t: %d\n", callback->m_eResult );
+	m_bConnectedToSteam = false;
+}
+
+
+
+//-----------------------------------------------------------------------------
+// Purpose: Function which needs to getting processed on frame
+//-----------------------------------------------------------------------------
+void SteamGameClientBridge::RunFrame( )
+{
+	SteamAPI_RunCallbacks();
+}
+//-----------------------------------------------------------------------------
+// Purpose: Constructor -- note the syntax for setting up Steam API callback handlers
+//-----------------------------------------------------------------------------
+SteamGameClientBridge::SteamGameClientBridge( ):
+	m_IPCFailureCallback( this, &SteamGameClientBridge::OnIPCFailure ),
+	m_SteamShutdownCallback( this, &SteamGameClientBridge::OnSteamShutdown ),
+	m_GameJoinRequested( this, &SteamGameClientBridge::OnGameJoinRequested ),
+	m_SteamServersConnected( this, &SteamGameClientBridge::OnSteamServersConnected ),
+	m_SteamServersDisconnected( this, &SteamGameClientBridge::OnSteamServersDisconnected ),
+	m_SteamServerConnectFailure( this, &SteamGameClientBridge::OnSteamServerConnectFailure ),
+	m_CallbackGameOverlayActivated( this, &SteamGameClientBridge::OnGameOverlayActivated ),
+	m_CallbackGameWebCallback( this, &SteamGameClientBridge::OnGameWebCallback )
+{
+
+	m_bConnectedToSteam = false;
+	this->initialized = true;
+
+}
+
+/*
+HKEY __cdecl SteamAPI_RegistryNameToHandle(const char *a1)
+{
+  HKEY result; // eax@7
+
+  if ( !_stricmp(a1, "HKEY_LOCAL_MACHINE") || !_stricmp(a1, "HKLM") )
+  {
+    result = HKEY_LOCAL_MACHINE;
+  }
+  else if ( !_stricmp(a1, "HKEY_CURRENT_USER") || !_stricmp(a1, "HKCU") )
+  {
+    result = HKEY_CURRENT_USER;
+  }
+  else if ( !_stricmp(a1, "HKEY_CLASSES_ROOT") || !_stricmp(a1, "HKCR") )
+  {
+    result = HKEY_CLASSES_ROOT;
+  }
+  else
+  {
+    result = 0;
+  }
+  return result;
+}
+
+
+bool SteamAPI_IsSteamRunningInternal()
+{
+  HKEY v0; // eax@1
+  HANDLE v1; // esi@3
+  char result; // al@3
+  DWORD Type; // [sp+0h] [bp-14h]@2
+  DWORD cbData; // [sp+4h] [bp-10h]@2
+  DWORD ExitCode; // [sp+8h] [bp-Ch]@3
+  DWORD Data; // [sp+Ch] [bp-8h]@1
+  HKEY phkResult; // [sp+10h] [bp-4h]@1
+
+  v0 = SteamAPI_RegistryNameToHandle("HKCU");
+  phkResult = 0;
+  Data = 0;
+  if ( !RegOpenKeyExA(v0, "Software\\Valve\\Steam\\ActiveProcess", 0, 0x20219u, &phkResult) )
+  {
+    cbData = 4;
+    RegQueryValueExA(phkResult, "pid", 0, &Type, (LPBYTE)&Data, &cbData);
+    RegCloseKey(phkResult);
+  }
+  v1 = OpenProcess(0x400u, 0, Data);
+  ExitCode = 0;
+  result = 0;
+  if ( v1 )
+  {
+    if ( GetExitCodeProcess(v1, &ExitCode) && ExitCode == 259 )
+    {
+      CloseHandle(v1);
+      result = 1;
+    }
+    else
+    {
+      CloseHandle(v1);
+      result = 0;
+    }
+  }
+  return result;
+}
+
+
+
+HMODULE __cdecl SteamApi_LoadClientDll(LPCSTR libname)
+{
+  unsigned int v7; // eax@3
+  wchar_t wpath[1024];
+  
+  v7 = MultiByteToWideChar(0xFDE9u, 0, libname, -1, wpath, sizeof(wpath) / 2);
+  if ( v7 < 1 || v7 < strlen(libname))
+	return LoadLibraryExA(libname, 0, 8u);
+
+  return LoadLibraryExW(wpath, 0, 8u);
+}
+
+
+char steamclientdllpathGlob[0x104];
+char __cdecl SteamAPI_GetSteamClientDLLPath(char *a1, size_t a2)
+{
+  char *v2; // ecx@1
+  char v3; // al@2
+  char result; // al@5
+  HKEY v5; // eax@6
+  LONG v6; // esi@6
+  bool v7; // zf@6
+  char *v9; // ecx@8
+  char v10; // bl@8
+  char v11; // al@9
+  HMODULE hSteamClient; // eax@11
+  unsigned int v13; // ecx@14
+  char v14; // al@15
+  char steamclientdllpath[260]; // [sp+0h] [bp-110h]@6
+  char path[0x104]; // [sp+1h] [bp-10Fh]@6
+  DWORD Type; // [sp+104h] [bp-Ch]@7
+  DWORD cbData; // [sp+108h] [bp-8h]@6
+  HKEY phkResult; // [sp+10Ch] [bp-4h]@6
+
+  v2 = steamclientdllpathGlob;
+  do
+    v3 = *v2++;
+  while ( v3 );
+  if ( v2 == &steamclientdllpathGlob[1] || a1 )
+  {
+    steamclientdllpath[0] = 0;
+    memset(path, 0, 0x103u);
+    cbData = 260;
+    v5 = SteamAPI_RegistryNameToHandle("HKCU");
+    phkResult = 0;
+    v6 = RegOpenKeyExA(v5, "Software\\Valve\\Steam\\ActiveProcess", 0, 0x20219u, &phkResult);
+    v7 = v6 == 0;
+    if ( !v6 )
+    {
+      v6 = RegQueryValueExA(phkResult, "SteamClientDll", 0, &Type, (LPBYTE)steamclientdllpath, &cbData);
+      RegCloseKey(phkResult);
+      v7 = v6 == 0;
+    }
+    v9 = steamclientdllpath;
+    v10 = v7;
+    do
+      v11 = *v9++;
+    while ( v11 );
+    if ( v9 == path )
+    {
+      hSteamClient = GetModuleHandleA("steamclient.dll");
+      GetModuleFileNameA(hSteamClient, steamclientdllpath, 0x104u);
+    }
+    if ( a1 )
+    {
+      strncpy(a1, steamclientdllpath, a2);
+      a1[a2 - 1] = 0;
+    }
+    strncpy(steamclientdllpathGlob, steamclientdllpath, 0x104u);
+    steamclientdllpathGlob[259] = 0;
+    v13 = strlen(steamclientdllpathGlob) - 1;
+    if ( (signed int)v13 > 0 )
+    {
+      do
+      {
+        v14 = steamclientdllpathGlob[v13];
+        if ( v14 == '\\' )
+          break;
+        if ( v14 == '/' )
+          break;
+        --v13;
+      }
+      while ( (signed int)v13 > 0 );
+      steamclientdllpathGlob[v13] = 0;
+    }
+    result = v10;
+  }
+  else
+  {
+    result = 1;
+  }
+  return result;
+}
+*/
+
+typedef void* (__cdecl *createInterface_t)(const char *, int *) ;
+
+createInterface_t __cdecl SteamApi_GetCreateInterfaceHandler(HMODULE *hSteamClient, char a2)
+{
+
+  char debugstring[1024];
+  if ( !hSteamClient )
+    return 0;
+/*
+
+  char dllpath[104];
+  steamclientdllpathGlob[0] = 0;
+  memset(dllpath, 0, 0x104u);
+
+  if ( SteamAPI_GetSteamClientDLLPath(dllpath, 0x104u) )
+  {
+    
+	if ( SteamAPI_IsSteamRunningInternal() )
+    {
+    
+      *hSteamClient = SteamApi_LoadClientDll(dllpath);
+      if ( !*hSteamClient )
+	  {  
+		  Com_sprintf(debugstring, sizeof(debugstring), "[S_API FAIL] SteamAPI_Init() failed; Sys_LoadModule failed to load: %s\n", dllpath);
+		  OutputDebugStringA(debugstring);
+	  }
+	  
+    }
+    else
+    {
+      OutputDebugStringA("[S_API FAIL] SteamAPI_Init() failed; SteamAPI_IsSteamRunning() failed.\n");
+    }
+  }*/
+
+  if ( !*hSteamClient )
+  {
+	if ( a2 )
+	{
+		*hSteamClient = LoadLibraryExA("steamclient.dll", NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+	}
+    
+	if ( !*hSteamClient )
+    {
+      Com_sprintf(debugstring, sizeof(debugstring), "[S_API FAIL] SteamAPI_Init() failed; unable to locate a local %s and %s and %s.\n", "steamclient.dll","tier0_s.dll","vstdlib_s.dll");
+      OutputDebugStringA(debugstring);
+	  Com_Error(1, debugstring);
+      return NULL;
+    }
+	
+  }
+    
+  if ( *hSteamClient )
+  {
+    return (void*  (__cdecl *)(const char *, int *))GetProcAddress(*hSteamClient, "CreateInterface");
+  }
+  return NULL;
+
+}
+
+
+ISteamClient* iSteamClient;
+HSteamPipe hSteamPipe;
+HSteamUser hSteamUser;
+IClientEngine* iClientEngine;
+IClientUtils* cUtils;
+IClientUser* cUser;
+HMODULE hSteamClientGlob;
+
+
+
+void SteamAPI_ShutdownInternal(void)
+{
+
+  if ( hSteamPipe && hSteamUser )
+  {
+    iSteamClient->ReleaseUser(hSteamPipe, hSteamUser);
+  }
+  hSteamUser = 0;
+ // memset(iSteamUser, 0, 4*18);
+  if ( hSteamPipe )
+    iSteamClient->BReleaseSteamPipe(hSteamPipe);
+  hSteamPipe = 0;
+  if ( iSteamClient )
+    iSteamClient->BShutdownIfAllPipesClosed();
+  iSteamClient = 0;
+  if ( hSteamClientGlob )
+  {
+    FreeLibrary(hSteamClientGlob);
+  }
+  hSteamClientGlob = 0;
+}
+
+
+SteamGameClientBridge* SteamGameClientBridge::InitAPI(  const wchar_t* dllpath ,int appID )
+{
+  HSteamUser _hSteamUser; // eax@4
+  int appid; // eax@8 MAPDST
+  ISteamUtils *iSteamUtils; // eax@9
+  ISteamUser *iSteamUserlocal; // eax@17
+  uint64_t *v9; // eax@18
+  uint64_t *v10; // eax@20
+  int v11; // [sp-8h] [bp-2Ch]@3
+  int v12; // [sp-4h] [bp-28h]@4
+  CHAR v13; // [sp+0h] [bp-24h]@15
+  CHAR Value; // [sp+18h] [bp-Ch]@13
+  CSteamID v15; // [sp+1Ch] [bp-8h]@15
+  char envValue[1024];
+  int retval;
+  byte backupbyte;
+  byte* patchaddr;
+  DWORD oldProtect;
+  createInterface_t CreateInterfaceFunction;
+  
+  if ( iSteamClient )
+  {
+    return 1;
+  }
+  
+  CreateInterfaceFunction = SteamApi_GetCreateInterfaceHandler(&hSteamClientGlob, 1);
+  
+  if ( !CreateInterfaceFunction )
+    return 0;
+	
+	/* Official */
+	iSteamClient = (ISteamClient*)CreateInterfaceFunction("SteamClient016", &retval);	
+	/* Unofficial */
+	IClientEngine* iClientEngine = (IClientEngine*)CreateInterfaceFunction("CLIENTENGINE_INTERFACE_VERSION004", &retval);
+	
+	if(iSteamClient == NULL || iClientEngine == NULL)
+	{
+		Com_PrintError("Steam: SteamAPI_Init() failed 3\n");
+		return 0;	
+	}else{
+		Com_Printf("Steam: SteamAPI_Init() return %d\n", retval);
+	}
+  
+  hSteamPipe =  iSteamClient->CreateSteamPipe();
+
+  cUtils = iClientEngine->GetIClientUtils(hSteamPipe, NULL);
+  DWORD **vtable = *(DWORD***)cUtils;
+  patchaddr = (byte*)vtable[16];  //vtable index for SetAppIDForCurrentPipe()
+
+  /*
+  Com_Printf("Addr ISteamClient = %x\n", iSteamClient); 
+  Com_Printf("Addr Engine = %x vtable = %x\n", iClientEngine, *(DWORD*)iClientEngine);
+  Com_Printf("Addr CUtils = %x vtable = %x\n", cUtils, *(DWORD*)cUtils);
+  Com_Printf("Addr vtable = %x\n", vtable);
+  Com_Printf("Addr = %x\n", patchaddr);
+*/
+
+  backupbyte = *patchaddr;
+  
+  VirtualProtect(patchaddr, 1, PAGE_READWRITE, &oldProtect);
+  *patchaddr = 0xc3;
+  VirtualProtect(patchaddr, 1,  oldProtect, &oldProtect);
+
+  hSteamUser = iSteamClient->ConnectToGlobalUser(hSteamPipe);
+
+  VirtualProtect(patchaddr, 1, PAGE_READWRITE, &oldProtect);  
+  *patchaddr = backupbyte;
+  VirtualProtect(patchaddr, 1,  oldProtect, &oldProtect);
+
+  if ( !hSteamPipe || !hSteamUser )
+  {
+    SteamAPI_ShutdownInternal();
+    return 0;
+  }
+  
+  cUser = iClientEngine->GetIClientUser(hSteamUser, hSteamPipe, NULL); 
+  
+  if(!cUser)
+  {
+    SteamAPI_ShutdownInternal();
+    return 0;
+  }  
+
+
+    /* Init for OpenSteamWorks ClientEngine */
+
+	// set the parent appid in the instance
+	uint32_t parentAppID = 42750;
+	#define PRODUCT_DISPLAY_NAME "CitizenFX:IV \xF0\x9F\x92\x8A"
+	
+	char ourDirectory[MAX_PATH];
+	char cmdline[MAX_PATH];
+	
+	GetCurrentDirectoryA(sizeof(ourDirectory), ourDirectory);
+	Com_sprintf(cmdline, sizeof(cmdline), "\"%s\" +steamdummy", Sys_ExeFile( ));
+	
+	// create an empty VAC blob
+	char blob[8];
+	memset(blob, 0, 8);
+	
+	// create a fake app to hold our gameid
+	uint64_t gameID = 0xACCF2DAB01000000 | parentAppID; // crc32 for 'kekking' + mod
+	CGameID cgameid(gameID);
+
+	cUser->SpawnProcess(blob, 0,  Sys_ExeFile( ),  cmdline, 0,  ourDirectory,  cgameid, parentAppID, PRODUCT_DISPLAY_NAME, 0);
+	cUtils->SetAppIDForCurrentPipe( parentAppID, 1 ) ;
+	/* End init for OpenSteamWorks */  
+
+  iSteamUtils = iSteamClient->GetISteamUtils(hSteamPipe, "SteamUtils007");
+  if ( !iSteamUtils || (appid = iSteamUtils->GetAppID()) == 0)
+  {
+    Com_Printf("[S_API FAIL] SteamAPI_Init() failed; no appID found.\nEither launch the game from Steam, or put the file steam_appid.txt containing the correct appID in your game folder.\n");
+    OutputDebugStringA("[S_API FAIL] SteamAPI_Init() failed; no appID found.\nEither launch the game from Steam, or put the file steam_appid.txt containing the correct appID in your game folder.\n");
+    SteamAPI_ShutdownInternal(); 
+	return 0;
+  }
+  return 1;
+   
+   
+#if 0
+  SteamAPI_SetBreakpadAppID(appid);
+  Steam_RegisterInterfaceFuncs_0(hSteamClientGlob);
+  SteamAPI_InitMinidumpBreakpadhandler();
+  SteamAPI_LoadGameoverlayRenderer();
+  ((void (__stdcall *)(int (__cdecl *)(int, int, void *, size_t, int), int, int))iSteamClient->vtable->GetISteamMusicRemote)(
+    sub_3B403B90,
+    v11,
+    v12);
+  iSteamClient->vtable->Set_SteamAPI_CPostAPIResultInProcess(iSteamClient, sub_3B403800);
+  if ( safe )
+  {
+    iSteamUserlocal = iSteamClient->vtable->GetISteamUser(iSteamClient, hSteamPipe, hSteamUser, "SteamUser017");
+    if ( iSteamUserlocal )
+    {
+      v9 = (uint64_t *)iSteamUserlocal->vtable->GetSteamID(iSteamUserlocal, &v15).steamid;
+      sub_3B403DF0(*v9);
+      return 1;
+    }
+  }
+  else
+  {
+    if ( iSteamUser )
+    {
+      v10 = (uint64_t *)iSteamUser->vtable->GetSteamID(iSteamUser, &v15).steamid;
+      sub_3B403DF0(*v10);
+      return 1;
+    }
+    sub_3B403DF0(0i64);
+  }
+  return 1;
+#endif
+}
+
+
+
+
+
+
+SteamGameClientBridge* SteamGameClientBridge::Init(  const wchar_t* dllpath ,int appID )
+{
+	
+	if(SteamAPI_InitInternal(dllpath, appID) == false){
+		Com_PrintError("Steam: SteamAPI_Init() failed\n");
+		return NULL;
+	}
+	
+	if(!SteamFriends() || !SteamClient()){
+		return NULL;
+	}
+
+	SteamClient()->SetWarningMessageHook( &Com_SteamClientApi_DebugCallback );
+	SteamGameClientBridge* isteamclientbridge = new SteamGameClientBridge();
+
+	return isteamclientbridge;
+}
+
+
+//-----------------------------------------------------------------------------
+// Purpose: Destructor
+//-----------------------------------------------------------------------------
+SteamGameClientBridge::~SteamGameClientBridge()
+{
+
+	// release our reference to the steam client library
+	SteamAPI_Shutdown();
+}
+
+uint32 SteamGameClientBridge::GetAuthTicket(unsigned char* data, int buflen)
+{
+	uint32 writtenlen;
+	
+	if(m_hAuthTicket != k_HAuthTicketInvalid)
+	{
+		SteamUser()->CancelAuthTicket( m_hAuthTicket );	
+		m_hAuthTicket = k_HAuthTicketInvalid;
+	}
+	
+	m_hAuthTicket = SteamUser()->GetAuthSessionTicket( data, buflen, &writtenlen );
+		
+	if(writtenlen < 10)
+	{
+		if ( m_hAuthTicket != k_HAuthTicketInvalid )
+		{
+			SteamUser()->CancelAuthTicket( m_hAuthTicket );
+			m_hAuthTicket = k_HAuthTicketInvalid;
+		}
+		return 0;
+	}
+	
+	return writtenlen;
+}
+
+void SteamGameClientBridge::CancelAuthTicket( )
+{
+	if(m_hAuthTicket != k_HAuthTicketInvalid)
+	{
+		SteamUser()->CancelAuthTicket( m_hAuthTicket );	
+		m_hAuthTicket = k_HAuthTicketInvalid;
+	}
+}
+
+
+extern "C" {
+	/* Begin now with client functions */
+	static SteamGameClientBridge* steamclientbridge;
+	
+	int Com_SteamClientApi_Load(const wchar_t* dllpath, int appID )
+	{
+		steamclientbridge = SteamGameClientBridge::Init( dllpath, appID );
+		if(steamclientbridge == NULL)
+		{
+			return 0;
+		}
+		return 1;
+	}
+	
+	void Com_SteamClientApi_Shutdown()
+	{
+		if(steamclientbridge == NULL)
+		{
+			return;
+		}
+		
+		delete steamclientbridge;
+		
+		steamclientbridge = NULL;
+	}
+	
+	int Com_SteamClientApi_IsLoaded()
+	{
+		if(steamclientbridge == NULL)
+		{
+			return 0;
+		}
+		return 1;
+	}
+	
+	void Com_SteamClientApi_RunFrame( )
+	{
+		if(steamclientbridge == NULL){
+			return;
+		}
+		steamclientbridge->RunFrame( );
+	}
+	
+
+	
+	void Com_SteamClientApi_SteamIDToString(uint64_t steamid, char* string, int length)
+	{
+		CSteamID *csteamid = new CSteamID(steamid);
+		if(csteamid == NULL){
+			string[0] = '\0';
+		}else{
+			Com_sprintf(string, length, "[%c:%u:%u]", accounttype[csteamid->GetEAccountType() % 16], csteamid->GetEUniverse(), csteamid->GetAccountID());
+		}
+		delete csteamid;
+	}
+
+	
+	uint64_t Com_SteamClientApi_GetSteamID( )
+	{
+		if(steamclientbridge == NULL){
+			return 0;
+		}
+		CSteamID csteamid;
+		uint64_t steamid64;
+	//	SteamUser()->GetSteamID( &csteamid );
+		steamid64 = 0;//csteamid.ConvertToUint64();
+		return steamid64;
+	}
+	
+	void Com_SteamClientApi_AdvertiseServer(uint32_t unIPServer, uint16_t usPortServer)
+	{
+		if(steamclientbridge == NULL){
+			return;
+		}
+	//	SteamUser()->AdvertiseGame( k_steamIDNonSteamGS, unIPServer, usPortServer );
+		steamclientbridge->isAdvertisingServer = true;
+	}
+	void Com_SteamClientApi_StopAdvertisingServer(  )
+	{
+		if(steamclientbridge == NULL || steamclientbridge->isAdvertisingServer == false){
+			return;
+		}
+	//	SteamUser()->AdvertiseGame( k_steamIDNonSteamGS, 0, 0 );
+		steamclientbridge->isAdvertisingServer = false;
+	}
+	
+	uint32 Com_SteamClientApi_GetAuthTicket(unsigned char* data, int buflen)
+	{
+		if(steamclientbridge == NULL){
+			return 0;
+		}
+		return steamclientbridge->GetAuthTicket(data, buflen);
+	}
+	
+	void Com_SteamClientApi_CancelAuthTicket( )
+	{
+		if(steamclientbridge == NULL){
+			return;
+		}
+		steamclientbridge->CancelAuthTicket();
+	}
+	
+	void Com_SteamClientApi_DebugCallback(int nSeverity, const char *pchDebugText)
+	{
+		Com_DPrintf(CON_CHANNEL_SYSTEM,"Steam: %s\n", pchDebugText);
+	}
+	
+	void Com_SteamClientApi_GetLocalPlayerName(char* playername, int len)
+	{
+		const char *playerName = SteamFriends()->GetPersonaName();
+		Q_strncpyz(playername, playerName, len);
+	}
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
+Only junk here
+
+
+void SSetCall(DWORD addr, void* destination){
+
+	DWORD callwidth;
+	byte* baddr = (byte*)addr;
+	
+	callwidth = (DWORD)( (DWORD)destination - (DWORD)baddr - 5);
+	*baddr = 0xe8;
+	baddr++;
+
+	*(DWORD*)baddr = callwidth;
+}
+
+void SSetJump(DWORD addr, void* destination){
+
+	DWORD jmpwidth;
+	byte* baddr = (byte*)addr;
+	
+	jmpwidth = (DWORD)(  (DWORD)destination -  (DWORD)baddr - 5);
+	*baddr = 0xe9;
+	baddr++;
+
+	*(DWORD*)baddr = jmpwidth;
+}
+
+
+typedef struct{
+	byte gap0[4];
+	byte* data;
+	byte gap8[8];
+	int dataReadBytes;
+	int numBytes;
+} pipebuffer;
+
+
+
+void *write2pipestart = (void*)0x382DF790;
+byte pipefncstartbytes[5];
+
+char __thiscall WriteToPipe(void *thiss, pipebuffer *pipeBuf, char a3)
+{
+	byte firstcmd;
+	int numBytes;
+	byte* data;
+	int lenData;
+	char buffer[256];
+	byte advertcmd[] = {0x01, 0x01, 0x00 , 0x00 , 0x00 , 0xB4 , 0x01 , 0x00 , 0x00 , 0xFE , 0xA6 , 0x00 , 0x01 , 0xAB , 0x2D , 0x8F , 0xA1 , 0x02 , 0x00 , 0x00 , 0x00 , 'C' , 0x00 , 0x00 , 0x00 , 0x00 , 0xCC , 0xCC , 0xFF , 0xFF , 0xEE , 0xEE};
+	byte newdatabuf[1024];
+	
+	
+	char (__thiscall *WriteToPipePtr)(void* thiss, pipebuffer *pipeBuf, char a3 ) = (char (__thiscall *)(void* thiss, pipebuffer *pipeBuf, char a3 ) )write2pipestart;
+	
+	numBytes = pipeBuf->numBytes;
+	firstcmd = pipeBuf->data[pipeBuf->dataReadBytes];
+	
+	data = &pipeBuf->data[pipeBuf->dataReadBytes +1];
+	lenData = numBytes -1;
+	
+	Com_sprintf(buffer, sizeof(buffer), "Header: Length: %d, 1stCmd: %d\n", lenData, firstcmd);
+	Com_LogDebugData((byte*)buffer, strlen(buffer));
+	Com_LogDebugData(data, lenData);
+	Com_LogDebugData((byte*)"\n\n", 2);
+
+	if(lenData == 31 && pipeBuf->dataReadBytes == 0)
+	{
+		newdatabuf[0] = firstcmd;
+		memcpy(&newdatabuf[1], advertcmd, sizeof(advertcmd));
+		pipeBuf->data = newdatabuf;
+		pipeBuf->numBytes = sizeof(advertcmd) +1;
+		Com_Printf("Reassigned pipe buffer\n");
+	}
+		
+	memcpy(write2pipestart, pipefncstartbytes, 5);	
+	
+	WriteToPipePtr(thiss, pipeBuf, a3);
+	
+	SSetJump((DWORD)write2pipestart, (void*)WriteToPipe);
+	
+	return 1;
+}
+
+
+void Write2PipeHookInit()
+{
+	DWORD oldProtect;
+	VirtualProtect(write2pipestart, 5, PAGE_EXECUTE_READWRITE, &oldProtect);
+	memcpy(pipefncstartbytes, write2pipestart, 5);
+	SSetJump((DWORD)write2pipestart, (void*)WriteToPipe);
+}
+
+*/
